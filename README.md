@@ -2,23 +2,33 @@
 
 Autonomous agent loop engine for IBM Bob — no external API key required.
 
-Bob's own model drives the loop. miniloop handles session state, workspace
-execution, task ledger, criteria gate, checkpoints, and audit trail via MCP.
+Bob's own model drives the loop via a `/loop` slash command. miniloop handles
+session state, workspace execution, task ledger, criteria gate, checkpoints,
+and audit trail via MCP.
 
 ## How it works
 
 ```
-Bob (model already running)
-    │
-    ├── loop_start(goal, workspace)   → create session, get instructions
-    ├── loop_tool(id, "list_files")   → see workspace
-    ├── loop_tool(id, "bash", ...)    → run tests, see failures
-    ├── loop_tool(id, "edit_file",..) → apply fix
-    ├── loop_tool(id, "bash", ...)    → verify fix passes
-    └── loop_finish(id, summary)      → criteria gate → done ✅
+You type: /loop fix the bug in /tmp/demo
+               │
+               ▼
+        Bob activates the loop skill
+        (loads workflow instructions)
+               │
+               ▼
+        Bob calls miniloop MCP tools turn by turn:
+               │
+               ├── loop_start(goal, workspace)
+               ├── loop_tool(id, "list_files", {})
+               ├── loop_tool(id, "bash", {"command": "pytest -v"})
+               ├── loop_tool(id, "read_file", {"path": "..."})
+               ├── loop_tool(id, "edit_file", {...})
+               ├── loop_tool(id, "bash", {"command": "pytest -v"})
+               └── loop_finish(id, summary) → criteria gate → done ✅
 ```
 
-miniloop makes zero LLM calls. Bob is the model. miniloop is the execution sandbox.
+The skill is the trigger + instructions. The MCP server is the execution engine.
+Neither works without the other. miniloop makes zero LLM calls — Bob is the model.
 
 ## Setup
 
@@ -29,7 +39,9 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Register the MCP server in `~/.bob/settings/mcp_settings.json`:
+### 1 — Register the MCP server
+
+Add to `~/.bob/settings/mcp_settings.json`:
 
 ```json
 {
@@ -44,28 +56,36 @@ Register the MCP server in `~/.bob/settings/mcp_settings.json`:
 }
 ```
 
-Then reload MCP servers in Bob (`Cmd+Shift+P` → **MCP: Reload Servers**).
+Reload: `Cmd+Shift+P` → **MCP: Reload Servers**
 
-## Usage in Bob chat
+### 2 — Install the skill
 
-```
-Set up a workspace with a broken test:
-  mkdir -p /tmp/buggy
-  echo 'def add(a,b): return a-b' > /tmp/buggy/calc.py
-  echo 'from calc import add\ndef test_add(): assert add(2,3)==5' > /tmp/buggy/test_calc.py
-
-Now use miniloop MCP tools to fix it:
-  goal: "Fix the failing pytest test"
-  workspace: "/tmp/buggy"
+```bash
+cp -r loop ~/.bob/skills/loop
 ```
 
-Bob will call `loop_start`, then iterate with `loop_tool`, then `loop_finish`.
+Bob picks it up automatically — no restart needed.
+
+## Usage
+
+```
+/loop fix the failing tests in /tmp/buggy
+```
+
+```
+/loop build a fizzbuzz function with passing pytest tests
+workspace: /tmp/fizz
+```
+
+Bob calls `loop_start`, iterates with `loop_tool`, then `loop_finish`. The
+criteria gate runs the test suite independently — `loop_finish` is rejected
+until all `check_cmd`s exit 0.
 
 ## MCP tools
 
 | Tool | Description |
 |---|---|
-| `loop_start(goal, workspace?)` | Create session, returns `session_id` + agent instructions |
+| `loop_start(goal, workspace?)` | Create session, return `session_id` + agent instructions |
 | `loop_tool(session_id, tool, args)` | Execute one workspace tool: `bash`, `read_file`, `write_file`, `edit_file`, `list_files`, `update_ledger` |
 | `loop_finish(session_id, summary)` | Run criteria gate — rejects if any `check_cmd` fails |
 | `loop_status(session_id)` | Get task ledger + criteria status |
@@ -74,7 +94,7 @@ Bob will call `loop_start`, then iterate with `loop_tool`, then `loop_finish`.
 ## What miniloop manages
 
 - **Session DB** — SQLite ledger of every session, turn, tool call, and result
-- **Task ledger** — planner generates tasks + machine-checkable success criteria at start
+- **Task ledger** — planner generates tasks + machine-checkable success criteria at session start
 - **Criteria gate** — `loop_finish` is rejected until all `check_cmd`s exit 0
 - **Checkpoints** — workspace state saved every turn; sessions are resumable
 - **Audit trail** — full event log queryable via `loop_replay`
@@ -83,12 +103,22 @@ Bob will call `loop_start`, then iterate with `loop_tool`, then `loop_finish`.
 
 ```
 miniloop/
-├── mcp_server.py   MCP server — the Bob interface (start here)
+├── mcp_server.py   MCP server — loop_start / loop_tool / loop_finish / loop_status / loop_replay
 ├── tools/          Workspace execution: bash, read_file, write_file, edit_file, list_files
 ├── db.py           SQLite session store (7 tables)
-├── loop.py         Standalone loop engine (CLI mode, requires LLM key)
+├── loop.py         Standalone CLI loop engine (requires LLM key in .env)
 └── config.py       Environment config
+
+loop/
+└── SKILL.md        Bob skill — activates on /loop, instructs Bob how to drive the MCP tools
 ```
 
-`loop.py` and `__main__.py` are the original standalone CLI — still works if you
-configure an LLM backend in `.env`, but the primary interface is the MCP server.
+## Relationship between skill and MCP
+
+The `/loop` command needs both:
+
+- **Skill** (`loop/SKILL.md`) — the trigger and workflow instructions. Tells Bob to call `loop_start` first, iterate with `loop_tool`, enforce `loop_finish` only when tests pass.
+- **MCP server** (`miniloop/mcp_server.py`) — the execution engine. Actually runs bash, reads/writes files, enforces the criteria gate, saves checkpoints to SQLite.
+
+Skill without MCP → Bob has instructions but no tools to call.
+MCP without skill → Bob has tools but doesn't know how to chain them.
