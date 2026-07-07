@@ -1,119 +1,180 @@
 """
-miniloop MCP server — exposes the loop engine as MCP tools so Bob (or any
-MCP-compatible host) can drive autonomous agent sessions without an external
-API key.
+miniloop MCP server — Bob-native zero-key architecture.
 
-Architecture
+How it works
 ------------
-When Bob calls loop_start("fix the failing tests"), miniloop does NOT make
-its own LLM calls. Instead the loop runs in "headless tool execution" mode:
+Bob's own model IS the agent loop. miniloop exposes the workspace execution
+primitives and session state as MCP tools. Bob calls them turn by turn —
+no external API key, no subprocess, no LLM calls from miniloop at all.
 
-  Bob (the model) ──calls──► loop_start MCP tool
-                                  │
-                                  ▼
-                        miniloop spawns a subprocess:
-                          python -m miniloop "<goal>" --autonomy auto
-                                  │
-                          (subprocess uses whatever .env says for LLM)
-                                  │
-                          returns when done/suspended
-                                  ▼
-                        MCP returns {session_id, status, summary}
+  Bob (model already running)
+      │
+      ├── loop_start(goal)          create session, return session_id + system prompt
+      ├── loop_tool(id, tool, args) execute one workspace tool, return result + updated ledger
+      ├── loop_finish(id, summary)  run criteria gate → pass or return failing criteria
+      ├── loop_status(id)           get ledger / stats mid-session
+      └── loop_replay(id)           get full event log
 
-This means:
-  - If .env has a Bob API key  → uses that
-  - If .env has no key at all  → subprocess fails gracefully with a message
-  - The MCP server itself is always available regardless
+Bob's system prompt instructs it to:
+  1. Call loop_start → get session_id and instructions
+  2. Loop: call loop_tool (bash/read_file/etc.) → read result → decide → repeat
+  3. When done: call loop_finish → if criteria fail, keep going; if pass, done
 
-The REAL zero-key path (Phase 2 of this work):
-  Replace the subprocess with a callback that calls back into Bob's own
-  model via the MCP reverse-call protocol (tools/call on the host).
-  That's ~1 day of additional work once this scaffold is proven.
-
-Tools exposed:
-  loop_start    — start a new session
-  loop_status   — get ledger + stats
-  loop_resume   — resume a suspended session
-  loop_replay   — get full event log
+This is exactly how Bob's own agent mode works — just with miniloop managing
+the session DB, ledger, criteria gate, checkpoints, and audit trail.
 
 Register in ~/.bob/settings/mcp_settings.json:
   {
     "mcpServers": {
       "miniloop": {
         "type": "stdio",
-        "command": "/absolute/path/to/.venv/bin/python",
+        "command": "/Users/bradencruz/Projects/agent-loops/.venv/bin/python",
         "args": ["-m", "miniloop.mcp_server"],
-        "cwd": "/absolute/path/to/agent-loops"
+        "cwd": "/Users/bradencruz/Projects/agent-loops"
       }
     }
   }
+
+Then in Bob chat:
+  Use the miniloop MCP tools to autonomously complete this goal:
+  "Fix the failing pytest tests in /tmp/buggy"
 """
+import argparse
 import json
 import os
 import subprocess
 import sys
+import time
 import uuid
-import argparse
 
 from miniloop.db import (
-    init_db, insert_session, get_session,
+    init_db, insert_session, get_session, update_session,
     get_tasks, get_criteria, get_events,
+    insert_event, insert_checkpoint, max_event_seq,
+    upsert_task, upsert_criterion,
 )
 from miniloop import config
+from miniloop.tools import dispatch, EFFECT
 
-# ── tool definitions (MCP schema) ─────────────────────────────────────────────
+# ── system prompt Bob gets when it calls loop_start ──────────────────────────
+
+AGENT_SYSTEM_PROMPT = """\
+You are an autonomous software engineer. You have been given a goal and a \
+set of miniloop MCP tools to complete it.
+
+WORKFLOW — follow exactly:
+1. You already called loop_start and have a session_id.
+2. Call loop_tool with tool="list_files" to see the workspace.
+3. Call loop_tool with tool="bash", args={"command":"python3 -m pytest -v"} \
+to run tests and see failures.
+4. Call loop_tool with tool="read_file" to read files you need to fix.
+5. Call loop_tool with tool="edit_file" or "write_file" to apply fixes.
+6. Call loop_tool with tool="bash" again to verify fixes pass.
+7. Only call loop_finish AFTER tests pass. It will be REJECTED if criteria fail.
+
+RULES:
+- Always use loop_tool — never assume file contents without reading.
+- Always run tests before calling loop_finish.
+- If loop_finish is rejected, read the failing criteria and fix them.
+- Call loop_status any time you need to re-orient on the ledger."""
+
+# ── tool definitions ──────────────────────────────────────────────────────────
 
 TOOL_DEFS = [
     {
         "name": "loop_start",
         "description": (
-            "Start an autonomous agent loop for a goal. The agent will plan, "
-            "write and run code, fix failing tests, and iterate until all "
-            "success criteria pass. Returns the session ID and final status."
+            "Start a new autonomous agent session. Returns the session_id and "
+            "the system instructions you must follow to complete the goal. "
+            "Call this FIRST before any loop_tool calls."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "goal": {
                     "type": "string",
-                    "description": "What the agent should accomplish"
+                    "description": "The goal to accomplish"
                 },
                 "workspace": {
                     "type": "string",
-                    "description": "Absolute path to working directory. A temp dir is created if omitted."
+                    "description": "Absolute path to the working directory. "
+                                   "A fresh temp dir is created if omitted."
                 },
                 "max_turns": {
                     "type": "integer",
-                    "description": f"Turn limit (default {config.DEFAULT_MAX_TURNS})"
+                    "description": f"Max tool calls before auto-suspend (default {config.DEFAULT_MAX_TURNS})"
                 },
                 "max_budget": {
                     "type": "number",
-                    "description": f"Spend cap in USD (default {config.DEFAULT_MAX_BUDGET})"
+                    "description": f"Spend cap USD — always 0 in Bob-native mode (default {config.DEFAULT_MAX_BUDGET})"
                 },
             },
             "required": ["goal"],
         },
     },
     {
-        "name": "loop_status",
-        "description": "Get status, task ledger, and success criteria for a session.",
+        "name": "loop_tool",
+        "description": (
+            "Execute one workspace tool inside the agent session. "
+            "Available tools: bash, read_file, write_file, edit_file, list_files, update_ledger. "
+            "Returns {ok, output, error, turn, ledger_summary}."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"}
+                "session_id": {
+                    "type": "string",
+                    "description": "Session ID from loop_start"
+                },
+                "tool": {
+                    "type": "string",
+                    "enum": ["bash", "read_file", "write_file", "edit_file",
+                             "list_files", "update_ledger"],
+                    "description": "Tool to execute"
+                },
+                "args": {
+                    "type": "object",
+                    "description": (
+                        "Tool arguments. "
+                        "bash: {command}. "
+                        "read_file: {path}. "
+                        "write_file: {path, content}. "
+                        "edit_file: {path, old_str, new_str}. "
+                        "list_files: {pattern?}. "
+                        "update_ledger: {tasks?, criteria?}."
+                    )
+                },
             },
-            "required": ["session_id"],
+            "required": ["session_id", "tool", "args"],
         },
     },
     {
-        "name": "loop_resume",
-        "description": "Resume a suspended session from its latest checkpoint.",
+        "name": "loop_finish",
+        "description": (
+            "Signal that the goal is complete. miniloop will verify all success criteria "
+            "by running their check commands. Returns {passed: true} on success, or "
+            "{passed: false, failing: [...]} if criteria still fail — in which case "
+            "you must fix them and call loop_finish again."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session_id": {"type": "string"},
-                "max_turns":  {"type": "string",
-                               "description": "'+N' to extend by N, or plain number to set absolute"},
+                "summary": {
+                    "type": "string",
+                    "description": "Short summary of what was accomplished"
+                },
+            },
+            "required": ["session_id", "summary"],
+        },
+    },
+    {
+        "name": "loop_status",
+        "description": "Get current session status, task ledger, and success criteria.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"}
             },
             "required": ["session_id"],
         },
@@ -131,63 +192,174 @@ TOOL_DEFS = [
     },
 ]
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def _python() -> str:
-    """Absolute path to the venv python that has miniloop installed."""
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    venv_py = os.path.join(here, ".venv", "bin", "python")
-    return venv_py if os.path.exists(venv_py) else sys.executable
-
-
-def _run_miniloop(args_list: list) -> tuple[int, str]:
-    """Run `python -m miniloop <args>` as a subprocess, return (returncode, output)."""
-    cmd = [_python(), "-m", "miniloop"] + args_list
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    proc = subprocess.run(
-        cmd, cwd=here,
-        capture_output=True, text=True, timeout=3600,   # 1h hard cap
-    )
-    return proc.returncode, (proc.stdout + proc.stderr)
-
-
 # ── tool handlers ─────────────────────────────────────────────────────────────
 
 def handle_loop_start(args: dict) -> dict:
     goal       = args["goal"]
-    workspace  = args.get("workspace") or ""
-    max_turns  = str(args.get("max_turns",  config.DEFAULT_MAX_TURNS))
-    max_budget = str(args.get("max_budget", config.DEFAULT_MAX_BUDGET))
+    max_turns  = int(args.get("max_turns",  config.DEFAULT_MAX_TURNS))
+    max_budget = float(args.get("max_budget", config.DEFAULT_MAX_BUDGET))
 
-    cli_args = [goal, "--autonomy", "auto",
-                "--max-turns", max_turns, "--max-budget", max_budget]
-    if workspace:
-        cli_args += ["--workspace", workspace]
+    session_id = str(uuid.uuid4())
+    workspace  = args.get("workspace") or os.path.abspath(
+        os.path.join(config.WORKSPACES_DIR, session_id)
+    )
+    os.makedirs(workspace, exist_ok=True)
 
-    # Capture the session_id printed on line 1 ("session: <uuid>")
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    cmd  = [_python(), "-m", "miniloop"] + cli_args
-    proc = subprocess.run(cmd, cwd=here, capture_output=True, text=True, timeout=3600)
-    output = proc.stdout + proc.stderr
+    insert_session(
+        session_id=session_id,
+        goal=goal,
+        workspace_path=os.path.abspath(workspace),
+        max_turns=max_turns,
+        max_budget_usd=max_budget,
+        model="bob-native",
+    )
+    update_session(session_id, status="running")
+    insert_event(session_id, 0, "system", {"event": "session_start", "goal": goal})
 
-    # Parse session_id from first line
-    session_id = None
-    for line in output.splitlines():
-        if line.startswith("session: "):
-            session_id = line.split("session: ", 1)[1].strip()
-            break
+    # Run the planner to generate tasks + criteria
+    _run_planner(session_id, goal, workspace)
 
-    if not session_id:
-        return {"error": "miniloop subprocess failed to start", "output": output[:2000]}
+    tasks    = [dict(t) for t in get_tasks(session_id)]
+    criteria = [dict(c) for c in get_criteria(session_id)]
 
-    row = get_session(session_id)
     return {
         "session_id": session_id,
-        "status":     row["status"] if row else "unknown",
-        "turns":      row["turn_count"] if row else 0,
-        "cost_usd":   round(row["cost_usd"], 4) if row else 0,
-        "workspace":  row["workspace_path"] if row else "",
-        "output_tail": output[-2000:],
+        "workspace":  workspace,
+        "goal":       goal,
+        "tasks":      tasks,
+        "criteria":   criteria,
+        "instructions": AGENT_SYSTEM_PROMPT,
+        "message": (
+            f"Session {session_id[:8]} started. Workspace: {workspace}. "
+            f"Follow the instructions field exactly. "
+            f"Use loop_tool to execute tools, loop_finish when done."
+        ),
+    }
+
+
+def handle_loop_tool(args: dict) -> dict:
+    session_id = args["session_id"]
+    tool_name  = args["tool"]
+    tool_args  = args.get("args", {})
+
+    row = get_session(session_id)
+    if not row:
+        return {"ok": False, "error": f"Session {session_id} not found"}
+
+    workspace  = row["workspace_path"]
+    turn       = row["turn_count"] + 1
+
+    # Check turn limit
+    if turn > row["max_turns"]:
+        update_session(session_id, status="suspended")
+        insert_event(session_id, turn, "system",
+                     {"event": "suspended", "reason": "max_turns"})
+        return {
+            "ok": False,
+            "error": f"Turn limit ({row['max_turns']}) reached. "
+                     f"Call loop_status to see progress, then loop_finish if done.",
+        }
+
+    # Handle update_ledger specially
+    if tool_name == "update_ledger":
+        for t in tool_args.get("tasks") or []:
+            upsert_task(session_id, t["id"], t["title"],
+                        t.get("status", "pending"), t.get("depends_on", []), 1)
+        for c in tool_args.get("criteria") or []:
+            upsert_criterion(session_id, c["id"], c["description"],
+                             c["check_cmd"], c.get("status", "pending"), "")
+        update_session(session_id, turn_count=turn)
+        insert_event(session_id, turn, "tool",
+                     {"tool": "update_ledger", "ok": True})
+        return {"ok": True, "output": "ledger updated", "error": None,
+                "turn": turn, "ledger_summary": _ledger_summary(session_id)}
+
+    # Execute the tool
+    t0     = time.monotonic()
+    result = dispatch(tool_name, tool_args, workspace, session_id)
+    dur    = int((time.monotonic() - t0) * 1000)
+
+    update_session(session_id, turn_count=turn)
+    insert_event(session_id, turn, "tool", {
+        "tool": tool_name, "args": tool_args,
+        "ok": result["ok"], "duration_ms": dur,
+    })
+    insert_checkpoint(session_id, turn, max_event_seq(session_id), [])
+
+    return {
+        "ok":             result["ok"],
+        "output":         result.get("output", ""),
+        "error":          result.get("error"),
+        "turn":           turn,
+        "ledger_summary": _ledger_summary(session_id),
+    }
+
+
+def handle_loop_finish(args: dict) -> dict:
+    session_id = args["session_id"]
+    summary    = args.get("summary", "")
+
+    row = get_session(session_id)
+    if not row:
+        return {"passed": False, "error": f"Session {session_id} not found"}
+
+    workspace = row["workspace_path"]
+    criteria  = get_criteria(session_id)
+
+    if not criteria:
+        # No criteria — accept finish
+        update_session(session_id, status="success")
+        insert_event(session_id, row["turn_count"], "result",
+                     {"status": "success", "summary": summary})
+        return {"passed": True, "summary": summary, "session_id": session_id}
+
+    # Run every check_cmd
+    failing = []
+    for c in criteria:
+        try:
+            from miniloop.tools import _VENV_BIN
+            env = os.environ.copy()
+            env["PATH"] = _VENV_BIN + ":" + env.get("PATH", "")
+            proc = subprocess.run(
+                c["check_cmd"], shell=True, cwd=workspace,
+                capture_output=True, text=True, timeout=60, env=env,
+            )
+            passed = proc.returncode == 0
+            output = (proc.stdout + proc.stderr)[:1000]
+        except Exception as e:
+            passed, output = False, str(e)
+
+        status = "passed" if passed else "failed"
+        upsert_criterion(session_id, c["id"], c["description"],
+                         c["check_cmd"], status, output)
+        if not passed:
+            failing.append({
+                "id":          c["id"],
+                "description": c["description"],
+                "check_cmd":   c["check_cmd"],
+                "output":      output[-500:],
+            })
+
+    if failing:
+        insert_event(session_id, row["turn_count"], "eval",
+                     {"event": "finish_rejected", "failing": len(failing)})
+        return {
+            "passed":  False,
+            "failing": failing,
+            "message": (
+                "Criteria not yet passing. Fix the issues above, "
+                "then call loop_finish again."
+            ),
+        }
+
+    update_session(session_id, status="success")
+    insert_event(session_id, row["turn_count"], "result",
+                 {"status": "success", "summary": summary})
+    return {
+        "passed":     True,
+        "summary":    summary,
+        "session_id": session_id,
+        "turns":      row["turn_count"],
     }
 
 
@@ -196,43 +368,15 @@ def handle_loop_status(args: dict) -> dict:
     row = get_session(session_id)
     if not row:
         return {"error": f"Session {session_id} not found"}
-    tasks    = [dict(t) for t in get_tasks(session_id)]
-    criteria = [dict(c) for c in get_criteria(session_id)]
     return {
         "session_id": session_id,
         "status":     row["status"],
         "goal":       row["goal"],
         "turns":      row["turn_count"],
         "max_turns":  row["max_turns"],
-        "cost_usd":   round(row["cost_usd"], 4),
         "workspace":  row["workspace_path"],
-        "tasks":      tasks,
-        "criteria":   criteria,
-    }
-
-
-def handle_loop_resume(args: dict) -> dict:
-    session_id = args["session_id"]
-    row = get_session(session_id)
-    if not row:
-        return {"error": f"Session {session_id} not found"}
-
-    cli_args = ["--resume", session_id, "--autonomy", "auto"]
-    if "max_turns" in args:
-        cli_args += ["--max-turns", str(args["max_turns"])]
-
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    proc = subprocess.run(
-        [_python(), "-m", "miniloop"] + cli_args,
-        cwd=here, capture_output=True, text=True, timeout=3600,
-    )
-    updated = get_session(session_id)
-    return {
-        "session_id": session_id,
-        "status":     updated["status"] if updated else "unknown",
-        "turns":      updated["turn_count"] if updated else 0,
-        "cost_usd":   round(updated["cost_usd"], 4) if updated else 0,
-        "output_tail": (proc.stdout + proc.stderr)[-2000:],
+        "tasks":      [dict(t) for t in get_tasks(session_id)],
+        "criteria":   [dict(c) for c in get_criteria(session_id)],
     }
 
 
@@ -254,10 +398,42 @@ def handle_loop_replay(args: dict) -> dict:
 
 HANDLERS = {
     "loop_start":  handle_loop_start,
+    "loop_tool":   handle_loop_tool,
+    "loop_finish": handle_loop_finish,
     "loop_status": handle_loop_status,
-    "loop_resume": handle_loop_resume,
     "loop_replay": handle_loop_replay,
 }
+
+# ── planner (calls miniloop's internal planner once at session start) ─────────
+
+def _run_planner(session_id: str, goal: str, workspace: str) -> None:
+    """
+    Generate a plan for the goal using the configured LLM (if available),
+    or fall back to a minimal default plan so the session is always usable.
+    """
+    try:
+        from miniloop.loop import _run_planner as loop_planner
+        loop_planner(goal, session_id, workspace)
+    except Exception:
+        # No LLM configured — insert a minimal placeholder plan
+        # Bob's model will refine this as it calls loop_tool
+        upsert_task(session_id, "T1", "Understand the workspace", "pending", [], 1)
+        upsert_task(session_id, "T2", "Implement the solution", "pending", ["T1"], 1)
+        upsert_task(session_id, "T3", "Verify all tests pass", "pending", ["T2"], 1)
+        insert_event(session_id, 0, "plan",
+                     {"tasks": 3, "criteria": 0, "source": "default"})
+
+
+def _ledger_summary(session_id: str) -> str:
+    tasks    = get_tasks(session_id)
+    criteria = get_criteria(session_id)
+    lines    = []
+    for t in tasks:
+        lines.append(f"[{t['status'].upper()}] {t['id']}: {t['title']}")
+    for c in criteria:
+        lines.append(f"[{c['status'].upper()}] {c['id']}: {c['description']}")
+    return "\n".join(lines) if lines else "(no ledger yet)"
+
 
 # ── JSON-RPC 2.0 stdio transport ──────────────────────────────────────────────
 
@@ -275,7 +451,8 @@ def serve_stdio() -> None:
         try:
             req = json.loads(raw)
         except json.JSONDecodeError:
-            _send({"jsonrpc":"2.0","id":None,"error":{"code":-32700,"message":"Parse error"}})
+            _send({"jsonrpc":"2.0","id":None,
+                   "error":{"code":-32700,"message":"Parse error"}})
             continue
 
         id_    = req.get("id")
@@ -285,35 +462,38 @@ def serve_stdio() -> None:
         if method == "initialize":
             _send({"jsonrpc":"2.0","id":id_,"result":{
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "miniloop", "version": "0.1.0"},
+                "capabilities":    {"tools": {}},
+                "serverInfo":      {"name": "miniloop", "version": "0.2.0"},
             }})
         elif method in ("notifications/initialized", "notifications/cancelled"):
-            pass  # no response for notifications
+            pass
         elif method == "tools/list":
             _send({"jsonrpc":"2.0","id":id_,"result":{"tools": TOOL_DEFS}})
         elif method == "tools/call":
             name    = params.get("name", "")
             handler = HANDLERS.get(name)
             if not handler:
-                _send({"jsonrpc":"2.0","id":id_,"error":{"code":-32601,"message":f"Unknown tool: {name}"}})
+                _send({"jsonrpc":"2.0","id":id_,
+                       "error":{"code":-32601,"message":f"Unknown tool: {name}"}})
                 continue
             try:
                 result = handler(params.get("arguments", {}))
                 _send({"jsonrpc":"2.0","id":id_,"result":{
                     "content": [{"type":"text","text":json.dumps(result, indent=2)}],
-                    "isError": "error" in result,
+                    "isError": "error" in result and not result.get("ok", True),
                 }})
             except Exception as e:
-                _send({"jsonrpc":"2.0","id":id_,"error":{"code":-32603,"message":str(e)}})
+                _send({"jsonrpc":"2.0","id":id_,
+                       "error":{"code":-32603,"message":str(e)}})
         elif id_ is not None:
-            _send({"jsonrpc":"2.0","id":id_,"error":{"code":-32601,"message":f"Unknown method: {method}"}})
+            _send({"jsonrpc":"2.0","id":id_,
+                   "error":{"code":-32601,"message":f"Unknown method: {method}"}})
 
 
 def main():
     parser = argparse.ArgumentParser(prog="miniloop-mcp")
     parser.add_argument("--port", type=int, default=None,
-                        help="Serve SSE on this port instead of stdio")
+                        help="Serve SSE on this port for debugging")
     a = parser.parse_args()
     if a.port:
         _serve_sse(a.port)
@@ -322,37 +502,35 @@ def main():
 
 
 def _serve_sse(port: int) -> None:
-    """Minimal SSE transport for browser/curl testing."""
     try:
         from flask import Flask, Response, request as freq
     except ImportError:
         print("SSE mode needs flask: pip install flask", file=sys.stderr)
         sys.exit(1)
-
     app = Flask(__name__)
     init_db()
 
     @app.route("/sse")
     def sse():
-        def stream():
-            yield "data: {\"type\":\"endpoint\",\"endpoint\":\"/message\"}\n\n"
-        return Response(stream(), mimetype="text/event-stream")
+        return Response(
+            (f'data: {{"type":"endpoint","endpoint":"/message"}}\n\n',),
+            mimetype="text/event-stream",
+        )
 
     @app.route("/message", methods=["POST"])
     def message():
-        req = freq.get_json(force=True)
-        # reuse stdio logic by routing through same handlers
-        method = req.get("method", "")
+        req    = freq.get_json(force=True)
         params = req.get("params", {})
-        if method == "tools/call":
+        if req.get("method") == "tools/call":
             name    = params.get("name", "")
             handler = HANDLERS.get(name)
             if handler:
                 result = handler(params.get("arguments", {}))
-                return {"content": [{"type":"text","text":json.dumps(result, indent=2)}]}
+                return {"content": [{"type":"text",
+                                     "text":json.dumps(result, indent=2)}]}
         return {"error": "unsupported"}
 
-    print(f"miniloop MCP SSE server on http://localhost:{port}/sse", file=sys.stderr)
+    print(f"miniloop MCP SSE on http://localhost:{port}/sse", file=sys.stderr)
     app.run(port=port)
 
 
