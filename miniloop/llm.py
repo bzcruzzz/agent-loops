@@ -2,20 +2,37 @@
 LLM client — calls any OpenAI-compatible /chat/completions endpoint.
 
 Configure via .env:
-    API_BASE_URL     endpoint base (default: Bob API)
+    API_BASE_URL     endpoint base  (default: Bob API)
     API_KEY          your key
-    API_AUTH_SCHEME  "apikey" or "Bearer" (default: apikey)
+    API_AUTH_SCHEME  "apikey" or "Bearer"  (default: apikey)
     MINILOOP_MODEL   model name
+
+Tool calling:
+  - Primary:  native OpenAI function_calls format (works with GPT-4, Claude via
+              compatible proxies, llama3.1, qwen2.5-coder:14b, etc.)
+  - Fallback: if a model doesn't emit native tool_calls, we parse JSON objects
+              out of the text response and match them to known tool names.
+              This lets smaller local models (qwen2.5-coder:7b, etc.) still drive
+              the loop even without native function-calling support.
 """
 import json
+import re
+import uuid
 import requests
 from miniloop.config import API_BASE_URL, API_KEY, API_AUTH_SCHEME, MODEL
+
+# Populated on first call to _convert_tools(); used by the text fallback parser.
+_KNOWN_TOOLS: set[str] = set()
 
 
 def complete(messages: list, tools: list, system: str) -> tuple[list, list, object]:
     """
-    Call an OpenAI-compatible chat completions endpoint.
+    Call an OpenAI-compatible /chat/completions endpoint.
     Returns (text_blocks, tool_use_blocks, usage).
+
+    text_blocks     — list of objects with .text
+    tool_use_blocks — list of objects with .id, .name, .input
+    usage           — object with .input_tokens, .output_tokens
     """
     if not API_KEY:
         raise RuntimeError(
@@ -27,20 +44,20 @@ def complete(messages: list, tools: list, system: str) -> tuple[list, list, obje
             "  API_AUTH_SCHEME=apikey    (or Bearer)"
         )
 
-    payload = {
+    payload: dict = {
         "model": MODEL,
         "max_tokens": 8096,
         "messages": [{"role": "system", "content": system}] + messages,
     }
     if tools:
-        payload["tools"] = _convert_tools(tools)
+        payload["tools"]       = _convert_tools(tools)   # also populates _KNOWN_TOOLS
         payload["tool_choice"] = "auto"
 
     resp = requests.post(
         f"{API_BASE_URL}/chat/completions",
         headers={
             "Authorization": f"{API_AUTH_SCHEME} {API_KEY}",
-            "Content-Type": "application/json",
+            "Content-Type":  "application/json",
         },
         json=payload,
         timeout=120,
@@ -53,23 +70,34 @@ def complete(messages: list, tools: list, system: str) -> tuple[list, list, obje
     message = data["choices"][0]["message"]
     usage   = data.get("usage", {})
 
-    text_blocks, tool_use_blocks = [], []
+    text_blocks:     list = []
+    tool_use_blocks: list = []
+    content: str = message.get("content") or ""
 
-    content = message.get("content") or ""
-    if content:
-        text_blocks.append(_TextBlock(content))
-
-    for tc in message.get("tool_calls") or []:
+    # ── Primary: native OpenAI function_calls ─────────────────────────────────
+    native = message.get("tool_calls") or []
+    for tc in native:
         fn = tc["function"]
         try:
             parsed = json.loads(fn.get("arguments", "{}"))
         except json.JSONDecodeError:
             parsed = {}
         tool_use_blocks.append(_ToolUseBlock(
-            id=tc.get("id", ""),
+            id=tc.get("id") or str(uuid.uuid4()),
             name=fn["name"],
             input=parsed,
         ))
+
+    # ── Fallback: parse JSON tool calls out of text ────────────────────────────
+    # Only activated when the model produced no native tool_calls but did
+    # produce text that contains JSON blobs matching known tool names.
+    if not native and content and _KNOWN_TOOLS:
+        parsed_calls, remaining = _parse_text_tool_calls(content)
+        tool_use_blocks.extend(parsed_calls)
+        content = remaining
+
+    if content.strip():
+        text_blocks.append(_TextBlock(content))
 
     return text_blocks, tool_use_blocks, _Usage(
         input_tokens=usage.get("prompt_tokens", 0),
@@ -77,17 +105,74 @@ def complete(messages: list, tools: list, system: str) -> tuple[list, list, obje
     )
 
 
-def _convert_tools(tools: list) -> list:
-    """Anthropic tool schema → OpenAI function-calling schema."""
-    return [{
-        "type": "function",
-        "function": {
-            "name": t["name"],
-            "description": t.get("description", ""),
-            "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
-        },
-    } for t in tools]
+# ── helpers ───────────────────────────────────────────────────────────────────
 
+def _convert_tools(tools: list) -> list:
+    """
+    Convert Anthropic-style tool schemas → OpenAI function-calling schema.
+    Also registers each tool name in _KNOWN_TOOLS for the text fallback.
+    """
+    result = []
+    for t in tools:
+        _KNOWN_TOOLS.add(t["name"])
+        result.append({
+            "type": "function",
+            "function": {
+                "name":        t["name"],
+                "description": t.get("description", ""),
+                "parameters":  t.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        })
+    return result
+
+
+def _parse_text_tool_calls(text: str) -> tuple[list, str]:
+    """
+    Fallback parser: find JSON objects in raw text that look like tool calls.
+
+    Handles the two most common patterns small models produce:
+      {"name": "bash", "arguments": {"command": "pytest -q"}}
+      {"name": "read_file", "input": {"path": "calc.py"}}
+
+    Returns (tool_use_blocks, remaining_text_with_json_stripped).
+    """
+    calls:     list = []
+    remaining: str  = text
+
+    # Match balanced single-level JSON objects (handles one level of nesting)
+    pattern = re.compile(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)?\}', re.DOTALL)
+
+    for match in pattern.finditer(text):
+        raw = match.group(0)
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        name = obj.get("name")
+        if name not in _KNOWN_TOOLS:
+            continue
+
+        # Accept arguments / input / args as the payload key
+        args = obj.get("arguments") or obj.get("input") or obj.get("args") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+
+        block = _ToolUseBlock(id=str(uuid.uuid4()), name=name, input=args)
+        calls.append(block)
+        remaining = remaining.replace(raw, "", 1).strip()
+
+    return calls, remaining
+
+
+# ── value objects ─────────────────────────────────────────────────────────────
 
 class _TextBlock:
     def __init__(self, text: str):

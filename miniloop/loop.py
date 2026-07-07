@@ -21,16 +21,25 @@ from miniloop.tools import SCHEMAS, EFFECT, dispatch
 
 console = Console()
 
-SYSTEM_PROMPT = """You are miniloop, an autonomous software engineer.
-You work inside a scratch workspace directory. Your job is to accomplish the user's goal completely.
+SYSTEM_PROMPT = """You are miniloop, an autonomous software engineer working in a scratch workspace.
 
-Loop: inspect the workspace state, act via tools, observe results, repeat.
+IMPORTANT: You MUST use tools. Do not answer in prose. Do not ask questions. Just act.
+
+Workflow — follow this exactly:
+1. Call list_files to see the workspace
+2. Call read_file on any relevant source and test files
+3. Call bash with "python3 -m pytest -v" (NOT make, NOT npm) to run tests and see failures
+4. Call read_file on files you need to fix
+5. Call edit_file to apply the fix
+6. Call bash with "python3 -m pytest -v" again to verify the fix works
+7. Only call finish() AFTER bash shows pytest passing with 0 failures
+
 Rules:
-- Never claim success without actually running the verification command.
-- Use bash to run tests, check outputs, and verify your work.
-- Use edit_file for targeted changes; read_file first if unsure of exact content.
-- When every success criterion passes, call finish() with a brief summary.
-- Be concise in your thinking — act more, narrate less."""
+- Use "python3 -m pytest -v" to run tests — never assume tests pass without running them
+- ALWAYS call list_files first — never guess filenames
+- If a file doesn't exist, it will show in list_files — use the EXACT filename shown
+- If edit_file says old_str not found, call read_file first to get exact content
+- finish() will be REJECTED if tests are not actually passing — always run pytest before calling it"""
 
 
 def _ledger_reminder(session_id: str) -> str:
@@ -340,20 +349,33 @@ def _loop(session_id: str, goal: str, workspace: str, autonomy: str,
                     "content": json.dumps(tool_result),
                 })
 
-            # ── append assistant + tool results to messages ───────────────────
-            # Build the assistant message content list
-            assistant_content = []
-            for tb in text_blocks:
-                assistant_content.append({"type": "text", "text": tb.text})
-            for b in tool_blocks:
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": b.id,
-                    "name": b.name,
-                    "input": b.input,
+            # ── append assistant + tool results to messages (OpenAI format) ──
+            # Assistant message: text content + tool_calls array
+            assistant_msg: dict = {"role": "assistant"}
+            combined_text = " ".join(tb.text for tb in text_blocks).strip()
+            if combined_text:
+                assistant_msg["content"] = combined_text
+            if tool_blocks:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id":       b.id,
+                        "type":     "function",
+                        "function": {
+                            "name":      b.name,
+                            "arguments": json.dumps(b.input),
+                        },
+                    }
+                    for b in tool_blocks
+                ]
+            messages.append(assistant_msg)
+
+            # Tool result messages: one per tool call (role: "tool")
+            for tr in tool_results_content:
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tr["tool_use_id"],
+                    "content":      tr["content"],
                 })
-            messages.append({"role": "assistant", "content": assistant_content})
-            messages.append({"role": "user", "content": tool_results_content})
 
             # ── checkpoint every turn (Phase 5 hook — DB write) ───────────────
             db.insert_checkpoint(

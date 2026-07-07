@@ -223,8 +223,19 @@ def edit_file(workspace: str, path: str, old_str: str, new_str: str) -> dict:
         return {"ok": False, "output": "", "error": str(e)}
 
 
+# Venv bin injected into PATH so pytest/pip are always found in workspace bash.
+# __file__ = miniloop/tools/__init__.py → .parent.parent.parent = project root
+_VENV_BIN = str(Path(__file__).parent.parent.parent / ".venv" / "bin")
+_PYTHON    = str(Path(__file__).parent.parent.parent / ".venv" / "bin" / "python3")
+
+
 def bash(workspace: str, command: str) -> dict:
     try:
+        # Prepend venv bin and rewrite bare 'python3'/'python' to use the venv
+        env = os.environ.copy()
+        env["PATH"] = _VENV_BIN + os.pathsep + env.get("PATH", "")
+        # rewrite so 'python3 -m pytest' resolves inside the venv
+        command = command.replace("python3 ", f"{_PYTHON} ").replace("python ", f"{_PYTHON} ")
         proc = subprocess.run(
             command,
             shell=True,
@@ -232,6 +243,7 @@ def bash(workspace: str, command: str) -> dict:
             capture_output=True,
             text=True,
             timeout=60,
+            env=env,
         )
         combined = proc.stdout + proc.stderr
         output = _truncate(combined)
@@ -264,15 +276,24 @@ def finish(workspace: str, summary: str) -> dict:
 def dispatch(tool_name: str, args: dict, workspace: str, session_id: str = None) -> dict:
     """Route a tool call to its implementation."""
     if tool_name == "read_file":
+        if "path" not in args:
+            return {"ok": False, "output": "", "error": "read_file requires 'path'"}
         return read_file(workspace, args["path"])
     elif tool_name == "list_files":
         return list_files(workspace, args.get("pattern", "**/*"))
     elif tool_name == "write_file":
+        if "path" not in args or "content" not in args:
+            return {"ok": False, "output": "", "error": "write_file requires 'path' and 'content'"}
         return write_file(workspace, args["path"], args["content"])
     elif tool_name == "edit_file":
+        if not all(k in args for k in ("path", "old_str", "new_str")):
+            return {"ok": False, "output": "", "error": "edit_file requires 'path', 'old_str', and 'new_str'"}
         return edit_file(workspace, args["path"], args["old_str"], args["new_str"])
     elif tool_name == "bash":
-        return bash(workspace, args["command"])
+        cmd = args.get("command") or args.get("cmd") or args.get("shell") or ""
+        if not cmd:
+            return {"ok": False, "output": "", "error": "bash requires a 'command' argument"}
+        return bash(workspace, cmd)
     elif tool_name == "update_ledger":
         # Handled in loop.py — should not reach here
         return {"ok": True, "output": "ledger updated", "error": None}
