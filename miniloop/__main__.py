@@ -36,28 +36,9 @@ def main(argv=None):
 
     # ── replay mode ──────────────────────────────────────────────────────────
     if args.replay:
-        from miniloop.db import get_events
-        events = get_events(args.replay)
-        if not events:
-            print(f"No events found for session {args.replay}")
-            sys.exit(1)
-        from rich.console import Console
-        from rich.table import Table
-        console = Console()
-        table = Table(title=f"Replay: {args.replay[:8]}…", show_lines=True)
-        table.add_column("seq", style="dim", width=5)
-        table.add_column("turn", width=4)
-        table.add_column("type", width=12)
-        table.add_column("payload summary")
-        import json
-        for ev in events:
-            try:
-                p = json.loads(ev["payload"])
-                summary = str(p)[:120]
-            except Exception:
-                summary = str(ev["payload"])[:120]
-            table.add_row(str(ev["seq"]), str(ev["turn"]), ev["type"], summary)
-        console.print(table)
+        init_db()
+        from miniloop.loop import replay_session
+        replay_session(args.replay)
         sys.exit(0)
 
     # ── resume mode ──────────────────────────────────────────────────────────

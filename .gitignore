@@ -1,0 +1,18 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# DB & workspaces (runtime state)
+miniloop.db
+workspaces/
+
+# macOS
+.DS_Store
