@@ -32,6 +32,13 @@ API_KEY         = os.environ.get("API_KEY") or os.environ.get("BOB_API_KEY", "")
 API_AUTH_SCHEME = os.environ.get("API_AUTH_SCHEME", "apikey")   # "Bearer" or "apikey"
 MODEL           = os.environ.get("MINILOOP_MODEL", "claude-sonnet-4-5")
 
+# ── LiteLLM proxy (IBM-internal pgx.blum.coffee) ─────────────────────────────
+# When LITELLM_API_KEY is set, miniloop routes ALL LLM calls through litellm.
+# The other API_* vars above are ignored in that mode.
+LITELLM_API_KEY  = os.environ.get("LITELLM_API_KEY", "")
+LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "https://pgx.blum.coffee/v1")
+LITELLM_MODEL    = os.environ.get("LITELLM_MODEL", "openai/chat")
+
 # Per-token prices (USD) for cost tracking
 INPUT_COST_PER_TOKEN  = float(os.environ.get("INPUT_COST_PER_TOKEN",  "0.000003"))
 OUTPUT_COST_PER_TOKEN = float(os.environ.get("OUTPUT_COST_PER_TOKEN", "0.000015"))

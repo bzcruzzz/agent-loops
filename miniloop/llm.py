@@ -1,25 +1,26 @@
 """
-LLM client — calls any OpenAI-compatible /chat/completions endpoint.
+LLM client — supports two backends, auto-selected from .env:
 
-Configure via .env:
-    API_BASE_URL     endpoint base  (default: Bob API)
-    API_KEY          your key
-    API_AUTH_SCHEME  "apikey" or "Bearer"  (default: apikey)
-    MINILOOP_MODEL   model name
+  1. LiteLLM proxy  (when LITELLM_API_KEY is set)
+     model="openai/chat"  api_base=https://pgx.blum.coffee/v1
+     Must be on IBM network / VPN.
 
-Tool calling:
-  - Primary:  native OpenAI function_calls format (works with GPT-4, Claude via
-              compatible proxies, llama3.1, qwen2.5-coder:14b, etc.)
-  - Fallback: if a model doesn't emit native tool_calls, we parse JSON objects
-              out of the text response and match them to known tool names.
-              This lets smaller local models (qwen2.5-coder:7b, etc.) still drive
-              the loop even without native function-calling support.
+  2. Raw OpenAI-compatible endpoint  (any other case)
+     Configure via API_BASE_URL / API_KEY / API_AUTH_SCHEME / MINILOOP_MODEL.
+     Works with Bob API, Anthropic, OpenAI, Ollama, etc.
+
+Both paths return the same (text_blocks, tool_use_blocks, usage) tuple.
 """
 import json
+import os
 import re
 import uuid
 import requests
-from miniloop.config import API_BASE_URL, API_KEY, API_AUTH_SCHEME, MODEL
+
+from miniloop.config import (
+    API_BASE_URL, API_KEY, API_AUTH_SCHEME, MODEL,
+    LITELLM_API_KEY, LITELLM_BASE_URL, LITELLM_MODEL,
+)
 
 # Populated on first call to _convert_tools(); used by the text fallback parser.
 _KNOWN_TOOLS: set[str] = set()
@@ -27,18 +28,93 @@ _KNOWN_TOOLS: set[str] = set()
 
 def complete(messages: list, tools: list, system: str) -> tuple[list, list, object]:
     """
-    Call an OpenAI-compatible /chat/completions endpoint.
+    Call the configured LLM backend.
     Returns (text_blocks, tool_use_blocks, usage).
 
     text_blocks     — list of objects with .text
     tool_use_blocks — list of objects with .id, .name, .input
     usage           — object with .input_tokens, .output_tokens
     """
+    if LITELLM_API_KEY:
+        return _complete_litellm(messages, tools, system)
+    return _complete_openai(messages, tools, system)
+
+
+# ── Backend 1: LiteLLM proxy ──────────────────────────────────────────────────
+
+def _complete_litellm(messages: list, tools: list, system: str) -> tuple[list, list, object]:
+    try:
+        import litellm
+        litellm.drop_params = True
+    except ImportError:
+        raise RuntimeError(
+            "litellm not installed. Run: pip install litellm"
+        )
+
+    oai_tools = _convert_tools(tools) if tools else []
+
+    kwargs = dict(
+        model=LITELLM_MODEL,
+        api_key=LITELLM_API_KEY,
+        api_base=LITELLM_BASE_URL,
+        messages=[{"role": "system", "content": system}] + messages,
+        max_tokens=8096,
+        temperature=0,
+    )
+    if oai_tools:
+        kwargs["tools"]       = oai_tools
+        kwargs["tool_choice"] = "auto"
+
+    resp = litellm.completion(**kwargs)
+
+    message = resp.choices[0].message
+    usage   = resp.usage or _Usage(0, 0)
+
+    text_blocks:     list = []
+    tool_use_blocks: list = []
+    content: str = message.content or ""
+
+    # Native tool calls
+    native = getattr(message, "tool_calls", None) or []
+    for tc in native:
+        fn = tc.function
+        try:
+            parsed = json.loads(fn.arguments or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+        tool_use_blocks.append(_ToolUseBlock(
+            id=tc.id or str(uuid.uuid4()),
+            name=fn.name,
+            input=parsed,
+        ))
+
+    # Text fallback
+    if not native and content and _KNOWN_TOOLS:
+        parsed_calls, remaining = _parse_text_tool_calls(content)
+        tool_use_blocks.extend(parsed_calls)
+        content = remaining
+
+    if content.strip():
+        text_blocks.append(_TextBlock(content))
+
+    return text_blocks, tool_use_blocks, _Usage(
+        input_tokens=getattr(usage, "prompt_tokens", 0),
+        output_tokens=getattr(usage, "completion_tokens", 0),
+    )
+
+
+# ── Backend 2: raw OpenAI-compatible requests ─────────────────────────────────
+
+def _complete_openai(messages: list, tools: list, system: str) -> tuple[list, list, object]:
     if not API_KEY:
         raise RuntimeError(
             "No API key set.\n"
-            "Add to .env:\n"
-            "  API_BASE_URL=<endpoint>   e.g. https://api.us-east.bob.ibm.com/inference/v1\n"
+            "For the LiteLLM proxy add to .env:\n"
+            "  LITELLM_API_KEY=sk-6vSzPoi24PyJA6UjGWfiUg\n"
+            "  LITELLM_BASE_URL=https://pgx.blum.coffee/v1\n"
+            "  LITELLM_MODEL=openai/chat\n\n"
+            "For a direct endpoint add:\n"
+            "  API_BASE_URL=<endpoint>\n"
             "  API_KEY=<your key>\n"
             "  MINILOOP_MODEL=<model name>\n"
             "  API_AUTH_SCHEME=apikey    (or Bearer)"
@@ -50,7 +126,7 @@ def complete(messages: list, tools: list, system: str) -> tuple[list, list, obje
         "messages": [{"role": "system", "content": system}] + messages,
     }
     if tools:
-        payload["tools"]       = _convert_tools(tools)   # also populates _KNOWN_TOOLS
+        payload["tools"]       = _convert_tools(tools)
         payload["tool_choice"] = "auto"
 
     resp = requests.post(
@@ -74,7 +150,7 @@ def complete(messages: list, tools: list, system: str) -> tuple[list, list, obje
     tool_use_blocks: list = []
     content: str = message.get("content") or ""
 
-    # ── Primary: native OpenAI function_calls ─────────────────────────────────
+    # Native tool calls
     native = message.get("tool_calls") or []
     for tc in native:
         fn = tc["function"]
@@ -88,9 +164,7 @@ def complete(messages: list, tools: list, system: str) -> tuple[list, list, obje
             input=parsed,
         ))
 
-    # ── Fallback: parse JSON tool calls out of text ────────────────────────────
-    # Only activated when the model produced no native tool_calls but did
-    # produce text that contains JSON blobs matching known tool names.
+    # Text fallback
     if not native and content and _KNOWN_TOOLS:
         parsed_calls, remaining = _parse_text_tool_calls(content)
         tool_use_blocks.extend(parsed_calls)
@@ -105,7 +179,7 @@ def complete(messages: list, tools: list, system: str) -> tuple[list, list, obje
     )
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── shared helpers ────────────────────────────────────────────────────────────
 
 def _convert_tools(tools: list) -> list:
     """
@@ -129,17 +203,11 @@ def _convert_tools(tools: list) -> list:
 def _parse_text_tool_calls(text: str) -> tuple[list, str]:
     """
     Fallback parser: find JSON objects in raw text that look like tool calls.
-
-    Handles the two most common patterns small models produce:
-      {"name": "bash", "arguments": {"command": "pytest -q"}}
-      {"name": "read_file", "input": {"path": "calc.py"}}
-
-    Returns (tool_use_blocks, remaining_text_with_json_stripped).
+    Handles {"name": "bash", "arguments": {...}} and {"name": "read_file", "input": {...}}.
     """
     calls:     list = []
     remaining: str  = text
 
-    # Match balanced single-level JSON objects (handles one level of nesting)
     pattern = re.compile(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)?\}', re.DOTALL)
 
     for match in pattern.finditer(text):
@@ -155,7 +223,6 @@ def _parse_text_tool_calls(text: str) -> tuple[list, str]:
         if name not in _KNOWN_TOOLS:
             continue
 
-        # Accept arguments / input / args as the payload key
         args = obj.get("arguments") or obj.get("input") or obj.get("args") or {}
         if isinstance(args, str):
             try:
@@ -165,8 +232,7 @@ def _parse_text_tool_calls(text: str) -> tuple[list, str]:
         if not isinstance(args, dict):
             args = {}
 
-        block = _ToolUseBlock(id=str(uuid.uuid4()), name=name, input=args)
-        calls.append(block)
+        calls.append(_ToolUseBlock(id=str(uuid.uuid4()), name=name, input=args))
         remaining = remaining.replace(raw, "", 1).strip()
 
     return calls, remaining
