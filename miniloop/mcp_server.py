@@ -411,17 +411,12 @@ def _run_planner(session_id: str, goal: str, workspace: str) -> None:
     Generate a plan for the goal using the configured LLM (if available),
     or fall back to a minimal default plan so the session is always usable.
     """
-    try:
-        from miniloop.loop import _run_planner as loop_planner
-        loop_planner(goal, session_id, workspace)
-    except Exception:
-        # No LLM configured — insert a minimal placeholder plan
-        # Bob's model will refine this as it calls loop_tool
-        upsert_task(session_id, "T1", "Understand the workspace", "pending", [], 1)
-        upsert_task(session_id, "T2", "Implement the solution", "pending", ["T1"], 1)
-        upsert_task(session_id, "T3", "Verify all tests pass", "pending", ["T2"], 1)
-        insert_event(session_id, 0, "plan",
-                     {"tasks": 3, "criteria": 0, "source": "default"})
+    # Bob is the model — skip external LLM planner, use default plan directly
+    upsert_task(session_id, "T1", "Understand the workspace", "pending", [], 1)
+    upsert_task(session_id, "T2", "Implement the solution", "pending", ["T1"], 1)
+    upsert_task(session_id, "T3", "Verify all tests pass", "pending", ["T2"], 1)
+    insert_event(session_id, 0, "plan",
+                 {"tasks": 3, "criteria": 0, "source": "default"})
 
 
 def _ledger_summary(session_id: str) -> str:
