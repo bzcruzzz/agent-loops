@@ -443,7 +443,10 @@ def _send(obj: dict) -> None:
 
 
 def serve_stdio() -> None:
-    init_db()
+    # Defer init_db() until first real interaction — Bob times out if the
+    # process takes too long to respond to the initialize handshake.
+    db_ready = False
+
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
@@ -460,13 +463,16 @@ def serve_stdio() -> None:
         params = req.get("params", {})
 
         if method == "initialize":
+            # Respond immediately — no DB or file I/O before this
             _send({"jsonrpc":"2.0","id":id_,"result":{
                 "protocolVersion": "2024-11-05",
                 "capabilities":    {"tools": {}},
                 "serverInfo":      {"name": "miniloop", "version": "0.2.0"},
             }})
         elif method in ("notifications/initialized", "notifications/cancelled"):
-            pass
+            if not db_ready:
+                init_db()
+                db_ready = True
         elif method == "tools/list":
             _send({"jsonrpc":"2.0","id":id_,"result":{"tools": TOOL_DEFS}})
         elif method == "tools/call":
